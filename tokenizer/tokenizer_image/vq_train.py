@@ -99,14 +99,14 @@ def main(args):
             entropy_loss_ratio=args.entropy_loss_ratio,
             dropout_p=args.dropout_p,
         )
-    
-    vq_model = VQ_models[args.vq_model](
-        codebook_size=args.codebook_size,
-        codebook_embed_dim=args.codebook_embed_dim,
-        commit_loss_beta=args.commit_loss_beta,
-        entropy_loss_ratio=args.entropy_loss_ratio,
-        dropout_p=args.dropout_p,
-    )
+    else:
+        vq_model = VQ_models[args.vq_model](
+            codebook_size=args.codebook_size,
+            codebook_embed_dim=args.codebook_embed_dim,
+            commit_loss_beta=args.commit_loss_beta,
+            entropy_loss_ratio=args.entropy_loss_ratio,
+            dropout_p=args.dropout_p,
+        )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
         ema = deepcopy(vq_model).to(device)  # Create an EMA of the model for use after training
@@ -192,7 +192,7 @@ def main(args):
     
 
     # Prepare models for training:
-    if args.ae_train:
+    if args.ae_load:
         checkpoint = torch.load(args.ae_path, map_location="cpu")
         vq_model.load_state_dict(checkpoint["model"], strict=False)
         del checkpoint
@@ -254,7 +254,11 @@ def main(args):
                 
                 if codebook_loss is None:
                     codebook_loss = (torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device))
-                
+                    
+                    # 
+                    # logger.info(f"{codebook_loss}")
+                    # print(codebook_loss)
+
                 loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=vq_model.module.decoder.last_layer, 
                                    logger=logger, log_every=args.log_every)
@@ -480,10 +484,10 @@ if __name__ == "__main__":
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     
-    parser.add_argument("--ae_train", type=bool, default=False, help="ae model path for resume training")
+    parser.add_argument("--ae-train", action='store_true', default=False, help="ae model path for resume training")
     
-    parser.add_argument("--ae_path", type=str, default=None, help="ae model path for resume training")
-    parser.add_argument("--ae_load", type=bool, default=False, help="using ae model to train vq model")
+    parser.add_argument("--ae-path", type=str, default=None, help="ae model path for resume training")
+    parser.add_argument("--ae-load", action='store_true', default=False, help="using ae model to train vq model")
     
     parser.add_argument("--val-data-path", type=str, default='/data3/zwh/imagenet100_var/val.X/', help="val data path")
     

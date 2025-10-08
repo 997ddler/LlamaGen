@@ -453,4 +453,4 @@ def VQ_16(**kwargs):
 def AE(**kwargs):
     return AEModel(ModelArgs(encoder_ch_mult=[1, 1, 2, 2, 4], decoder_ch_mult=[1, 1, 2, 2, 4], **kwargs))
 
-VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8}
+VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8, 'AE': AE}

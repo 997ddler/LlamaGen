@@ -254,10 +254,7 @@ def main(args):
                 
                 if codebook_loss is None:
                     codebook_loss = (torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device))
-                    
-                    # 
-                    # logger.info(f"{codebook_loss}")
-                    # print(codebook_loss)
+
 
                 loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=vq_model.module.decoder.last_layer, 

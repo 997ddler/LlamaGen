@@ -45,6 +45,12 @@ class AEModel(nn.Module):
         dec = self.decode(h)
         return dec, None
 
+    @torch.no_grad()
+    def img_to_reconstructed_img(self, x):
+        h = self.encode(x)
+        dec = self.decode(h)
+        return dec
+
 
 
 

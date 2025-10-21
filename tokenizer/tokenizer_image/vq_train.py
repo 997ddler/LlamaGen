@@ -2,6 +2,10 @@
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/train.py
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
 import torch
+import warnings
+warnings.filterwarnings('ignore')
+
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -37,13 +41,13 @@ from dataset.build import build_dataset
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from tokenizer.tokenizer_image.vq_loss import VQLoss
 
-# from evaluator import Evaluator
+# from evaluations.c2i.evaluator_modify import Evaluator
 # import tensorflow.compat.v1 as tf
+
 from tokenizer.validation.val_ddp import center_crop_arr
 
 
-import warnings
-warnings.filterwarnings('ignore')
+
 
 #################################################################################
 #                                  Training Loop                                #
@@ -98,6 +102,8 @@ def main(args):
             commit_loss_beta=args.commit_loss_beta,
             entropy_loss_ratio=args.entropy_loss_ratio,
             dropout_p=args.dropout_p,
+            soft_l2_loss=args.soft_l2_loss,
+            codebook_l2_norm=args.codebook_l2_norm,
         )
     else:
         vq_model = VQ_models[args.vq_model](
@@ -106,6 +112,8 @@ def main(args):
             commit_loss_beta=args.commit_loss_beta,
             entropy_loss_ratio=args.entropy_loss_ratio,
             dropout_p=args.dropout_p,
+            codebook_l2_norm=args.codebook_l2_norm,
+            kmeans_ini_flag=args.kmeans_ini_flag,
         )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -194,7 +202,13 @@ def main(args):
     # Prepare models for training:
     if args.ae_load:
         checkpoint = torch.load(args.ae_path, map_location="cpu")
-        vq_model.load_state_dict(checkpoint["model"], strict=False)
+        missing_keys, unexpected_keys = vq_model.load_state_dict(
+            checkpoint["model"], strict=False
+        )
+        if missing_keys:
+            logger.warning(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys: {unexpected_keys}")
         del checkpoint
         logger.info(f"Resume training from checkpoint: {args.ae_path}")
     
@@ -252,8 +266,8 @@ def main(args):
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss = vq_model(imgs)
                 
-                if codebook_loss is None:
-                    codebook_loss = (torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device))
+                if args.ae_train:
+                    codebook_loss = (codebook_loss, torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device))
 
 
                 loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
@@ -316,28 +330,29 @@ def main(args):
                 # Compute validation metrics
                 
                 vq_model.eval()
-                total = 0
-                samples = []
-                gt = []
-                for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
-                    with torch.no_grad():
-                        x = x.to(device, non_blocking=True)
-                        sample = vq_model.module.img_to_reconstructed_img(x)
-                        sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
-                        x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                # total = 0
+                # samples = []
+                # gt = []
+                # for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
+                #     with torch.no_grad():
+                #         x = x.to(device, non_blocking=True)
+                #         sample = vq_model.module.img_to_reconstructed_img(x)
+                #         sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                #         x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
                     
-                    sample = torch.cat(dist_all_gather(sample), dim=0)
-                    x = torch.cat(dist_all_gather(x), dim=0)
-                    samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
-                    gt.append(x.to("cpu", dtype=torch.uint8).numpy())
+                #         sample = torch.cat(dist_all_gather(sample), dim=0)
+                #         x = torch.cat(dist_all_gather(x), dim=0)
+                #         samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
+                #         gt.append(x.to("cpu", dtype=torch.uint8).numpy())
 
-                    total += sample.shape[0]
-                vq_model.train()
-                logger.info(f"Ealuate total {total} files.")
-                dist.barrier()
+                #     total += sample.shape[0]
+                # logger.info(f"Evaluate total {total} files.")
+                
+                
+                # dist.barrier()
 
                 # if rank == 0:
-                #     samples = np.concatenate(samples, axis=0)
+                #    samples = np.concatenate(samples, axis=0)
                 #    gt = np.concatenate(gt, axis=0)
                 #    config = tf.ConfigProto(
                 #        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
@@ -358,49 +373,50 @@ def main(args):
 
                 #    logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
                     # eval code, delete prev if not the best
-                #    if curr_fid == None:
-                #        curr_fid = [FID, train_steps]
-                #    elif FID <= curr_fid[0]:
-                #        # os.remove(f"{cloud_checkpoint_dir}/{curr_fid[1]:07d}.pt")
-                #        curr_fid = [FID, train_steps]
-
                 #    vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
 
                 # dist.barrier()
                 
                 
-                stats_sum = torch.zeros(5, device=device)  # rec, p, rec_p, vq, cmt, usage 
-                num_batches_local = len(val_loader)
+                stats_sum = torch.zeros(4, device=device)
+                num_samples_local = 0 
 
                 with torch.no_grad():
                     for x, _ in tqdm(val_loader, disable=(rank != 0),
                                     desc=f'eval step {train_steps:07d} epoch {epoch+1}'):
                         x = x.to(device, non_blocking=True)
+                        batch_size = x.size(0)
+                        
                         recons, val_codebook_loss = vq_model(x)
+                        rec_loss, p_loss, rec_p_loss = vq_loss.module.validation(x, recons) 
+                        
+                        if args.ae_train:
+                            other_loss = torch.tensor(val_codebook_loss, device=device)
+                        else:
+                            other_loss = torch.tensor(0.0, device=device)
+                        
+                        scalars = [rec_loss, p_loss, rec_p_loss, other_loss]
+                        scalars = [s if torch.is_tensor(s) else torch.tensor(s, device=device) for s in scalars]
+                        batch_stats = torch.stack(scalars)
+                        
+                        stats_sum += batch_stats * batch_size
+                        num_samples_local += batch_size
 
-                        rec_loss, p_loss, rec_p_loss = vq_loss.validation(imgs, recons)
+                total_stats = torch.zeros(5, device=device)
+                total_stats[:4] = stats_sum
+                total_stats[4] = num_samples_local
 
-                        scalars = [rec_loss, p_loss, rec_p_loss, val_codebook_loss[0], val_codebook_loss[1], val_codebook_loss[3]]   # rec, p, rec_p, vq, cmt, usage 
-                        scalars = [s if torch.is_tensor(s) else torch.tensor(s, device=device)
-                                for s in scalars]
-                        batch_stats = torch.stack(scalars)  # shape (5,)
+                dist.all_reduce(total_stats)
 
-                        stats_sum += batch_stats / num_batches_local  # avg batch
-
-                # all processes sum and avg
-                dist.all_reduce(stats_sum)
-                stats_mean = stats_sum / dist.get_world_size()  # now global avg
-
-                (val_rec_loss, val_p_loss, val_rec_p_loss, val_vq_loss, val_cmt_loss, val_usage) = stats_mean.tolist()
+                stats_mean = total_stats[:4] / total_stats[4]
+                (val_rec_loss, val_p_loss, val_rec_p_loss, val_other_loss) = stats_mean.tolist()
 
                 if dist.get_rank() == 0:
                     log_module.wandb_tracker.log({
                         "eval_rec_loss": val_rec_loss,
                         "eval_p_loss": val_p_loss,
                         "eval_rec_p_loss": val_rec_p_loss,
-                        "eval_vq_loss": val_vq_loss,
-                        "eval_commit_loss": val_cmt_loss,
-                        "eval_usage": val_usage,
+                        "eval_other_loss": val_other_loss,
                     }, step=train_steps)
 
                 dist.barrier()
@@ -426,9 +442,10 @@ def main(args):
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
                     
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, cloud_checkpoint_path)
-                    logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
+                    # torch.save(checkpoint, cloud_checkpoint_path)
+                    # logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
                 dist.barrier()
+                vq_model.train()
 
     vq_model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -464,7 +481,7 @@ if __name__ == "__main__":
     parser.add_argument("--gen-loss", type=str, choices=['hinge', 'non-saturating'], default='hinge', help="generator loss for gan training")
     parser.add_argument("--compile", action='store_true', default=False)
     parser.add_argument("--dropout-p", type=float, default=0.0, help="dropout_p")
-    parser.add_argument("--results-dir", type=str, default="results_tokenizer_image")
+    parser.add_argument("--results-dir", type=str, default="/scratch/e1374536/results_tokenizer_image")
     parser.add_argument("--dataset", type=str, default='imagenet')
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--epochs", type=int, default=40)
@@ -473,11 +490,11 @@ if __name__ == "__main__":
     parser.add_argument("--beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--beta2", type=float, default=0.95, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--global-batch-size", type=int, default=32) # ori 128
+    parser.add_argument("--global-batch-size", type=int, default=128) # ori 128
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=5000)
+    parser.add_argument("--ckpt-every", type=int, default=1000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     
@@ -487,6 +504,9 @@ if __name__ == "__main__":
     parser.add_argument("--ae-load", action='store_true', default=False, help="using ae model to train vq model")
     
     parser.add_argument("--val-data-path", type=str, default='/data3/zwh/imagenet100_var/val.X/', help="val data path")
+    parser.add_argument("--soft-l2-loss", action='store_true', default=False, help="soft l2 loss")
+    
+    parser.add_argument("--kmeans-ini-flag", action='store_true', default=False, help="kmeans initialization")
     
     
     args = parser.parse_args()

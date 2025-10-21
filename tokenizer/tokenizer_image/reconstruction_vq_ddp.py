@@ -16,10 +16,18 @@ import itertools
 from skimage.metrics import peak_signal_noise_ratio as psnr_loss
 from skimage.metrics import structural_similarity as ssim_loss
 
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '../..'))
+sys.path.append(project_root)
+
 from dataset.augmentation import center_crop_arr
 from dataset.build import build_dataset
 from tokenizer.tokenizer_image.vq_model import VQ_models
 
+
+from torchvision.datasets import ImageFolder
 
 
 def create_npz_from_sample_folder(sample_dir, num=50000):
@@ -60,6 +68,11 @@ def main(args):
         codebook_embed_dim=args.codebook_embed_dim)
     vq_model.to(device)
     vq_model.eval()
+
+
+    ckpt_name = args.vq_ckpt.split("/")[-1]
+
+
     checkpoint = torch.load(args.vq_ckpt, map_location="cpu")
     if "ema" in checkpoint:  # ema
         model_weight = checkpoint["ema"]
@@ -69,12 +82,13 @@ def main(args):
         model_weight = checkpoint["state_dict"]
     else:
         raise Exception("please check model weight")
-    vq_model.load_state_dict(model_weight)
+    msg = vq_model.load_state_dict(model_weight,strict=False)
+    print(msg)
     del checkpoint
 
     # Create folder to save samples:
-    folder_name = (f"{args.vq_model}-{args.dataset}-size-{args.image_size}-size-{args.image_size_eval}"
-                  f"-codebook-size-{args.codebook_size}-dim-{args.codebook_embed_dim}-seed-{args.global_seed}")
+    folder_name = (f"{args.vq_model}-{args.dataset}-size-{args.image_size}-size-{args.image_size_eval}-{ckpt_name}"
+                  f"-codebook-size-{args.codebook_size}-dim-{args.codebook_embed_dim}-seed-{args.global_seed}-{args.test_loader}")
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -94,6 +108,13 @@ def main(args):
     elif args.dataset == 'coco':
         dataset = build_dataset(args, transform=transform)
         num_fid_samples = 5000
+    elif args.dataset == 'imagenet100':
+        dataset = build_dataset(args, transform=transform)
+        if args.test_loader:
+            num_fid_samples = 20000
+        else:
+            num_fid_samples = 5000
+    
     else:
         raise Exception("please check dataset")
     
@@ -130,8 +151,14 @@ def main(args):
         rgb_gts = (rgb_gts.permute(0, 2, 3, 1).to("cpu").numpy() + 1.0) / 2.0 # rgb_gt value is between [0, 1]
         x = x.to(device, non_blocking=True)
         with torch.no_grad():
-            latent, _, [_, _, indices] = vq_model.encode(x)
-            samples = vq_model.decode_code(indices, latent.shape) # output value is between [-1, 1]
+
+            if args.vq_model == 'AE':
+                # latent, _, [_, _, indices] = vq_model.encode(x)
+                # samples = vq_model.decode_code(indices, latent.shape) # output value is between [-1, 1]
+                samples, _ = vq_model(x)
+            else:
+                latent, _, [_, _, indices] = vq_model.encode(x)
+                samples = vq_model.decode_code(indices, latent.shape) # output value is between [-1, 1]
             if args.image_size_eval != args.image_size:
                 samples = F.interpolate(samples, size=(args.image_size_eval, args.image_size_eval), mode='bicubic')
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
@@ -182,7 +209,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, choices=['imagenet', 'coco'], default='imagenet')
+    parser.add_argument("--dataset", type=str, choices=['imagenet', 'coco','imagenet100'], default='imagenet')
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
     parser.add_argument("--codebook-size", type=int, default=16384, help="codebook size for vector quantization")
@@ -193,5 +220,6 @@ if __name__ == "__main__":
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--test-loader", action="store_true", default=False)
     args = parser.parse_args()
     main(args)

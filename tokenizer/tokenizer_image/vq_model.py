@@ -8,12 +8,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch.distributed as tdist
+from sklearn.cluster import KMeans
 
 @dataclass
 class ModelArgs:
     codebook_size: int = 16384
     codebook_embed_dim: int = 8
-    codebook_l2_norm: bool = True
+    codebook_l2_norm: bool = True # Original llamagen is True
     codebook_show_usage: bool = True
     commit_loss_beta: float = 0.25
     entropy_loss_ratio: float = 0.0
@@ -22,32 +24,58 @@ class ModelArgs:
     decoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
     z_channels: int = 256
     dropout_p: float = 0.0
+    
+    soft_l2_loss: bool = False
+    kmeans_ini_flag: bool = False
 
 class AEModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
+        
+        if config.codebook_l2_norm:
+            print('codebook_l2_norm is True')
+            if config.soft_l2_loss:
+                print('soft_l2_loss is True')
+            else:
+                print('soft_l2_loss is False')
+        
         self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         
+    def soft_l2_loss(self, h):
+        # h shape: [B, C, H, W]
+        h_reshaped = h.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+        norm = torch.norm(h_reshaped, p=2, dim=-1)  # [B, H, W]
+        target_norm = 1.0
+        reg_loss = torch.mean((norm - target_norm) ** 2)
+        return reg_loss  
+    
     def encode(self, x):
         h = self.encoder(x)
-        if self.config.codebook_l2_norm:
-            h = F.normalize(h, p=2, dim=-1)
-        return h
+        
+        reg_loss = 0.0
+        if self.config.codebook_l2_norm: 
+            if  self.config.soft_l2_loss:
+                reg_loss = self.soft_l2_loss(h)
+            else:
+                h = F.normalize(h, p=2, dim=-1)
+                reg_loss = 0.0
+        
+        return h, reg_loss
     
     def decode(self, h):
         h = self.decoder(h)
         return h
     
     def forward(self, x):
-        h = self.encode(x)
+        h, loss = self.encode(x)
         dec = self.decode(h)
-        return dec, None
+        return dec, loss
 
     @torch.no_grad()
     def img_to_reconstructed_img(self, x):
-        h = self.encode(x)
+        h, _ = self.encode(x)
         dec = self.decode(h)
         return dec
 
@@ -63,7 +91,7 @@ class VQModel(nn.Module):
 
         self.quantize = VectorQuantizer(config.codebook_size, config.codebook_embed_dim, 
                                         config.commit_loss_beta, config.entropy_loss_ratio,
-                                        config.codebook_l2_norm, config.codebook_show_usage)
+                                        config.codebook_l2_norm, config.codebook_show_usage, config.kmeans_ini_flag)
         self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
 
@@ -84,7 +112,7 @@ class VQModel(nn.Module):
         return dec
 
     def forward(self, input):
-        quant, diff, _ = self.encode(input)
+        quant, diff, _ = self.encode(input) 
         dec = self.decode(quant)
         return dec, diff
     
@@ -230,7 +258,7 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage):
+    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage, kmeans_ini_flag):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -239,12 +267,34 @@ class VectorQuantizer(nn.Module):
         self.l2_norm = l2_norm
         self.show_usage = show_usage
 
+        self.kmeans_ini_flag = kmeans_ini_flag
+
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
         if self.l2_norm:
             self.embedding.weight.data = F.normalize(self.embedding.weight.data, p=2, dim=-1)
         if self.show_usage:
             self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536)))
+            
+        self.register_buffer('initialized_buffer', torch.zeros(1, dtype=torch.bool))
+
+    @torch.no_grad()
+    def init_codebook_with_first_batch(self, data):
+        if self.initialized_buffer.item():
+            return
+
+        if tdist.get_rank() == 0:
+            data = data.reshape(-1, self.e_dim)
+            
+            if isinstance(data, torch.Tensor):
+                data = data.detach().float().cpu().numpy()
+            print('begin initialize')
+            kmeans = KMeans(n_clusters=self.n_e, random_state=0).fit(data)
+            centroids = torch.from_numpy(kmeans.cluster_centers_).to(self.embedding.weight.device)
+            print('finish initialize')
+            self.embedding.weight.data.copy_(centroids)
+            self.initialized_buffer.fill_(True)
+
 
     
     def forward(self, z):
@@ -252,6 +302,31 @@ class VectorQuantizer(nn.Module):
         z = torch.einsum('b c h w -> b h w c', z).contiguous()
         z_flattened = z.view(-1, self.e_dim)
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+
+        if self.training and not self.initialized_buffer.item() and self.kmeans_ini_flag:
+            rank = tdist.get_rank()
+            world_size = tdist.get_world_size()
+            
+            z_flattened_detached = z_flattened.detach()
+            
+            gathered_list = [torch.zeros_like(z_flattened_detached) for _ in range(world_size)]
+            
+            tdist.barrier()
+            tdist.all_gather(gathered_list, z_flattened_detached)
+            
+            if rank == 0:
+                print('Initializing codebook with first training batch')
+                concatenated_f_BChw = torch.cat(gathered_list, dim=0)
+                self.init_codebook_with_first_batch(concatenated_f_BChw)
+            
+            tdist.barrier() 
+
+            # Broadcast the initialized weights and flag to all processes
+            tdist.broadcast(self.embedding.weight.data, 0)
+            tdist.broadcast(self.initialized_buffer, 0)
+            
+            tdist.barrier()
+
 
         if self.l2_norm:
             z = F.normalize(z, p=2, dim=-1)

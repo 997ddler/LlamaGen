@@ -14,6 +14,8 @@ import argparse
 import random
 
 
+
+
 class SingleFolderDataset(Dataset):
     def __init__(self, directory, transform=None):
         super().__init__()
@@ -88,7 +90,11 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     # Create folder to save samples:
-    folder_name = f"val_{args.dataset}"
+    if args.test_loader:
+        folder_name = f"test_{args.dataset}"
+    else:
+        folder_name = f"val_{args.dataset}"
+
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -108,6 +114,11 @@ def main(args):
     elif args.dataset == 'coco':
         dataset = SingleFolderDataset(args.data_path, transform=transform)
         num_fid_samples = 5000
+    elif args.dataset == 'imagenet100':
+        dataset = ImageFolder(args.data_path, transform=transform)
+        
+        
+        num_fid_samples = 5000 if not args.test_loader else 20000
     else:
         raise Exception("please check dataset")
     
@@ -155,11 +166,14 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, choices=['imagenet', 'coco'], default='imagenet')
+    parser.add_argument("--dataset", type=str, choices=['imagenet', 'coco','imagenet100'], default='imagenet')
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--sample-dir", type=str, default="reconstructions")
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
+
+    parser.add_argument("--test-loader", action="store_true", default=False)
+
     args = parser.parse_args()
     main(args)

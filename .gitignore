@@ -167,3 +167,14 @@ results_tokenizer_image/
 tokenizer_ori/*
 
 environment.yml
+
+./PBS_Scripts/
+
+llama_gen*
+bash_output/
+PBS_Scripts/
+
+classify_image_graph_def.pb
+Eval_*
+*.o*
+val_cmd.txt

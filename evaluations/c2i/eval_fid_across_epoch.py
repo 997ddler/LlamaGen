@@ -57,7 +57,7 @@ def extract_iteration_number(ckpt_path):
         return None
 
 
-def get_checkpoint_files(weights_dir, interval=2000):
+def get_checkpoint_files(weights_dir, interval=5000):
     """
     file format: 0034000.pt (pure number.pt, guaranteed to be a multiple of 500)
     """
@@ -232,7 +232,8 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     
     # create model
-    wandb_tracker = wandb.init(project='LlamaGen-VQ')
+    if rank == 0:   
+        wandb_tracker = wandb.init(project='LlamaGen-VQ')
 
     vq_model = VQ_models[args.vq_model](
         codebook_size=args.codebook_size,
@@ -294,7 +295,7 @@ def main(args):
     # evaluate each checkpoint
     fid_results = {}
     for ckpt_iter, ckpt_path in checkpoint_list:
-        if ckpt_iter < 100000:
+        if ckpt_iter < 280000:
             continue
         
         fid, psnr, ssim = evaluate_checkpoint(

@@ -217,7 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 384, 512], default=256)
     parser.add_argument("--image-size-eval", type=int, choices=[256, 384, 512], default=256)
     parser.add_argument("--sample-dir", type=str, default="reconstructions")
-    parser.add_argument("--per-proc-batch-size", type=int, default=32)
+    parser.add_argument("--per-proc-batch-size", type=int, default=64)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--test-loader", action="store_true", default=False)

@@ -41,8 +41,8 @@ from dataset.build import build_dataset
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from tokenizer.tokenizer_image.vq_loss import VQLoss
 
-# from evaluations.c2i.evaluator_modify import Evaluator
-# import tensorflow.compat.v1 as tf
+from evaluations.c2i.evaluator_modify import Evaluator
+import tensorflow.compat.v1 as tf
 
 from tokenizer.validation.val_ddp import center_crop_arr
 
@@ -74,6 +74,13 @@ def main(args):
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.vq_model.replace("/", "-")
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
+        
+        # logout the args
+        os.makedirs(f"{experiment_dir}", exist_ok=True)
+        with open(f"{experiment_dir}/args.txt", "w") as f:
+            for arg in vars(args):
+                f.write(f"{arg}: {getattr(args, arg)}\n")
+        
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
@@ -114,6 +121,10 @@ def main(args):
             dropout_p=args.dropout_p,
             codebook_l2_norm=args.codebook_l2_norm,
             kmeans_ini_flag=args.kmeans_ini_flag,
+            # soft ae training
+            soft_ae_training=args.soft_ae_training,
+            soft_ae_iters=args.soft_ae_iters,
+            soft_ae_scheduler=args.soft_ae_scheduler,
         )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -316,66 +327,72 @@ def main(args):
                 
                 log_module = vq_loss.module
                 
+                
+                sche_a = vq_model.module.quantize.sche_a if args.soft_ae_training else 0.0
                 if dist.get_rank() == 0:
                     log_module.wandb_tracker.log({
                         "train_loss": avg_loss,
                         "lr": optimizer.param_groups[0]["lr"],
+                        "sche_a": sche_a,
                     },
                         step=train_steps
                     )
-                
+            
+            if args.soft_ae_training:
+                vq_model.module.quantize.update_sche_a(train_steps)
+
 
             # Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 # Compute validation metrics
                 
                 vq_model.eval()
-                # total = 0
-                # samples = []
-                # gt = []
-                # for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
-                #     with torch.no_grad():
-                #         x = x.to(device, non_blocking=True)
-                #         sample = vq_model.module.img_to_reconstructed_img(x)
-                #         sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
-                #         x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                total = 0
+                samples = []
+                gt = []
+                for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
+                    with torch.no_grad():
+                        x = x.to(device, non_blocking=True)
+                        sample = vq_model.module.img_to_reconstructed_img(x)
+                        sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                        x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
                     
-                #         sample = torch.cat(dist_all_gather(sample), dim=0)
-                #         x = torch.cat(dist_all_gather(x), dim=0)
-                #         samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
-                #         gt.append(x.to("cpu", dtype=torch.uint8).numpy())
+                        sample = torch.cat(dist_all_gather(sample), dim=0)
+                        x = torch.cat(dist_all_gather(x), dim=0)
+                        samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
+                        gt.append(x.to("cpu", dtype=torch.uint8).numpy())
 
-                #     total += sample.shape[0]
+                        total += sample.shape[0]
                 # logger.info(f"Evaluate total {total} files.")
                 
                 
-                # dist.barrier()
+                dist.barrier()
 
-                # if rank == 0:
-                #    samples = np.concatenate(samples, axis=0)
-                #    gt = np.concatenate(gt, axis=0)
-                #    config = tf.ConfigProto(
-                #        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
-                #    )
-                #    config.gpu_options.allow_growth = True
+                if rank == 0:
+                   samples = np.concatenate(samples, axis=0)
+                   gt = np.concatenate(gt, axis=0)
+                   config = tf.ConfigProto(
+                       allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+                   )
+                   config.gpu_options.allow_growth = True
 
-                #    evaluator = Evaluator(tf.Session(config=config),batch_size=32)
-                #    evaluator.warmup()
-                #    logger.info("computing reference batch activations...")
-                #    ref_acts = evaluator.read_activations(gt)
-                #    logger.info("computing/reading reference batch statistics...")
-                #    ref_stats, _ = evaluator.read_statistics(gt, ref_acts)
-                #    logger.info("computing sample batch activations...")
-                #    sample_acts = evaluator.read_activations(samples)
-                #    logger.info("computing/reading sample batch statistics...")
-                #    sample_stats, _ = evaluator.read_statistics(samples, sample_acts)
-                #    FID = sample_stats.frechet_distance(ref_stats)
+                   evaluator = Evaluator(tf.Session(config=config),batch_size=32)
+                   evaluator.warmup()
+                   logger.info("computing reference batch activations...")
+                   ref_acts = evaluator.read_activations(gt)
+                   logger.info("computing/reading reference batch statistics...")
+                   ref_stats, _ = evaluator.read_statistics(gt, ref_acts)
+                   logger.info("computing sample batch activations...")
+                   sample_acts = evaluator.read_activations(samples)
+                   logger.info("computing/reading sample batch statistics...")
+                   sample_stats, _ = evaluator.read_statistics(samples, sample_acts)
+                   FID = sample_stats.frechet_distance(ref_stats)
 
-                #    logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
+                   logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
                     # eval code, delete prev if not the best
-                #    vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
+                   vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
 
-                # dist.barrier()
+                dist.barrier()
                 
                 
                 stats_sum = torch.zeros(4, device=device)
@@ -467,7 +484,7 @@ if __name__ == "__main__":
     parser.add_argument("--ema", action='store_true', help="whether using ema training")
     parser.add_argument("--codebook-size", type=int, default=16384, help="codebook size for vector quantization")
     parser.add_argument("--codebook-embed-dim", type=int, default=8, help="codebook dimension for vector quantization")
-    parser.add_argument("--codebook-l2-norm", action='store_true', default=True, help="l2 norm codebook")
+    parser.add_argument("--codebook-l2-norm", action='store_true', default=False, help="l2 norm codebook")
     parser.add_argument("--codebook-weight", type=float, default=1.0, help="codebook loss weight for vector quantization")
     parser.add_argument("--entropy-loss-ratio", type=float, default=0.0, help="entropy loss ratio in codebook loss")
     parser.add_argument("--commit-loss-beta", type=float, default=0.25, help="commit loss beta in codebook loss")
@@ -507,7 +524,12 @@ if __name__ == "__main__":
     parser.add_argument("--soft-l2-loss", action='store_true', default=False, help="soft l2 loss")
     
     parser.add_argument("--kmeans-ini-flag", action='store_true', default=False, help="kmeans initialization")
+
+    parser.add_argument("--soft-ae-training", action='store_true', default=False, help="use soft ae training")
+    parser.add_argument("--soft-ae-iters", type=int, default=25000, help="soft ae training iterations")
+    parser.add_argument("--soft-ae-scheduler", type=str, default='cosine', help="soft ae training scheduler")
     
+    parser.add_argument("--uni-constraint", action='store_true', default=False, help="enable the uniform constraint")
     
     args = parser.parse_args()
     

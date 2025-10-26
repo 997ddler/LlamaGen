@@ -145,14 +145,14 @@ def main(args):
 
     loader = tqdm(loader) if rank == 0 else loader
     total = 0
-    for x, _ in loader:
-        samples = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+    # for x, _ in loader:
+    #     samples = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
         # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+    #    for i, sample in enumerate(samples):
+    #        index = i * dist.get_world_size() + rank + total
+    #        Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
 
-        total += global_batch_size
+    #    total += global_batch_size
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()

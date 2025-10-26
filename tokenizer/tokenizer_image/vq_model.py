@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import torch.distributed as tdist
 from sklearn.cluster import KMeans
+import math
 
 @dataclass
 class ModelArgs:
@@ -27,6 +28,11 @@ class ModelArgs:
     
     soft_l2_loss: bool = False
     kmeans_ini_flag: bool = False
+    
+    soft_ae_training: bool = False
+    soft_ae_iters: int = 25000
+    soft_ae_scheduler: str = 'cosine'
+    
 
 class AEModel(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -43,6 +49,9 @@ class AEModel(nn.Module):
         self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         
+        self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
+        self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
+        
     def soft_l2_loss(self, h):
         # h shape: [B, C, H, W]
         h_reshaped = h.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
@@ -53,6 +62,8 @@ class AEModel(nn.Module):
     
     def encode(self, x):
         h = self.encoder(x)
+        h = self.quant_conv(h)
+        
         
         reg_loss = 0.0
         if self.config.codebook_l2_norm: 
@@ -65,7 +76,9 @@ class AEModel(nn.Module):
         return h, reg_loss
     
     def decode(self, h):
+        h = self.post_quant_conv(h)
         h = self.decoder(h)
+
         return h
     
     def forward(self, x):
@@ -91,7 +104,9 @@ class VQModel(nn.Module):
 
         self.quantize = VectorQuantizer(config.codebook_size, config.codebook_embed_dim, 
                                         config.commit_loss_beta, config.entropy_loss_ratio,
-                                        config.codebook_l2_norm, config.codebook_show_usage, config.kmeans_ini_flag)
+                                        config.codebook_l2_norm, config.codebook_show_usage, config.kmeans_ini_flag,
+                                        config.soft_ae_training, config.soft_ae_iters, config.soft_ae_scheduler
+                                        )
         self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
 
@@ -258,7 +273,7 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage, kmeans_ini_flag):
+    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage, kmeans_ini_flag, soft_ae_training, soft_ae_iters, soft_ae_scheduler):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -277,6 +292,13 @@ class VectorQuantizer(nn.Module):
             self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536)))
             
         self.register_buffer('initialized_buffer', torch.zeros(1, dtype=torch.bool))
+        
+        self.soft_ae_training = soft_ae_training
+        self.soft_ae_iters = soft_ae_iters
+        self.soft_ae_scheduler = soft_ae_scheduler
+        
+        if self.soft_ae_training:
+            self.sche_a = 1.0
 
     @torch.no_grad()
     def init_codebook_with_first_batch(self, data):
@@ -295,6 +317,21 @@ class VectorQuantizer(nn.Module):
             self.embedding.weight.data.copy_(centroids)
             self.initialized_buffer.fill_(True)
 
+    def update_sche_a(self, cur_iter):
+        if cur_iter >= self.soft_ae_iters:
+            self.sche_a = 0.0
+            return
+        
+        progress = cur_iter / self.soft_ae_iters
+        
+        if self.soft_ae_scheduler == 'cosine':
+            self.sche_a = 0.5 * (1 + math.cos(math.pi * progress))
+        elif self.soft_ae_scheduler == 'linear':
+            self.sche_a = 1 - progress
+        elif self.soft_ae_scheduler == 'exponential':
+            self.sche_a = math.exp(-5 * progress)
+        else:
+            raise ValueError(f"Invalid scheduler: {self.soft_ae_scheduler}")
 
     
     def forward(self, z):
@@ -360,8 +397,14 @@ class VectorQuantizer(nn.Module):
             commit_loss = self.beta * torch.mean((z_q.detach() - z) ** 2) 
             entropy_loss = self.entropy_loss_ratio * compute_entropy_loss(-d)
 
-        # preserve gradients
-        z_q = z + (z_q - z).detach()
+        if self.training and self.soft_ae_training:
+            z_q = self.sche_a * z + (1-self.sche_a) * (z + (z_q - z).detach())
+            commit_loss = (0.5 * (1 - self.sche_a) + 0.5) * commit_loss
+            vq_loss = (0.5 * (1 - self.sche_a) + 0.5) * vq_loss
+            
+        else: 
+            # preserve gradients
+            z_q = z + (z_q - z).detach()
 
         # reshape back to match original input shape
         z_q = torch.einsum('b h w c -> b c h w', z_q)

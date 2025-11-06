@@ -57,7 +57,7 @@ def extract_iteration_number(ckpt_path):
         return None
 
 
-def get_checkpoint_files(weights_dir, interval=5000):
+def get_checkpoint_files(weights_dir, interval=50000):
     """
     file format: 0034000.pt (pure number.pt, guaranteed to be a multiple of 500)
     """
@@ -71,6 +71,9 @@ def get_checkpoint_files(weights_dir, interval=5000):
     # extract iteration and filter
     ckpt_dict = {}
     for ckpt_file in ckpt_files:
+
+
+
         iteration = extract_iteration_number(str(ckpt_file))
         if iteration is not None and iteration % interval == 0:
             ckpt_dict[iteration] = str(ckpt_file)
@@ -295,8 +298,8 @@ def main(args):
     # evaluate each checkpoint
     fid_results = {}
     for ckpt_iter, ckpt_path in checkpoint_list:
-        if ckpt_iter < 280000:
-            continue
+        if ckpt_iter < 470000:
+             continue
         
         fid, psnr, ssim = evaluate_checkpoint(
             args, vq_model, ckpt_path, ckpt_iter, 

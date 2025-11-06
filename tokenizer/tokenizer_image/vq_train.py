@@ -41,8 +41,8 @@ from dataset.build import build_dataset
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from tokenizer.tokenizer_image.vq_loss import VQLoss
 
-from evaluations.c2i.evaluator_modify import Evaluator
-import tensorflow.compat.v1 as tf
+# from evaluations.c2i.evaluator_modify import Evaluator
+# import tensorflow.compat.v1 as tf
 
 from tokenizer.validation.val_ddp import center_crop_arr
 
@@ -347,52 +347,52 @@ def main(args):
                 # Compute validation metrics
                 
                 vq_model.eval()
-                total = 0
-                samples = []
-                gt = []
-                for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
-                    with torch.no_grad():
-                        x = x.to(device, non_blocking=True)
-                        sample = vq_model.module.img_to_reconstructed_img(x)
-                        sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
-                        x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                # total = 0
+                # samples = []
+                # gt = []
+                # for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
+                #     with torch.no_grad():
+                #         x = x.to(device, non_blocking=True)
+                #         sample = vq_model.module.img_to_reconstructed_img(x)
+                #         sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                #         x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
                     
-                        sample = torch.cat(dist_all_gather(sample), dim=0)
-                        x = torch.cat(dist_all_gather(x), dim=0)
-                        samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
-                        gt.append(x.to("cpu", dtype=torch.uint8).numpy())
+                #        sample = torch.cat(dist_all_gather(sample), dim=0)
+                #        x = torch.cat(dist_all_gather(x), dim=0)
+                #        samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
+                #        gt.append(x.to("cpu", dtype=torch.uint8).numpy())
 
-                        total += sample.shape[0]
+                #        total += sample.shape[0]
                 # logger.info(f"Evaluate total {total} files.")
                 
                 
-                dist.barrier()
+                # dist.barrier()
 
-                if rank == 0:
-                   samples = np.concatenate(samples, axis=0)
-                   gt = np.concatenate(gt, axis=0)
-                   config = tf.ConfigProto(
-                       allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
-                   )
-                   config.gpu_options.allow_growth = True
+                # if rank == 0:
+                #    samples = np.concatenate(samples, axis=0)
+                #    gt = np.concatenate(gt, axis=0)
+                #    config = tf.ConfigProto(
+                #        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+                #    )
+                #    config.gpu_options.allow_growth = True
 
-                   evaluator = Evaluator(tf.Session(config=config),batch_size=32)
-                   evaluator.warmup()
-                   logger.info("computing reference batch activations...")
-                   ref_acts = evaluator.read_activations(gt)
-                   logger.info("computing/reading reference batch statistics...")
-                   ref_stats, _ = evaluator.read_statistics(gt, ref_acts)
-                   logger.info("computing sample batch activations...")
-                   sample_acts = evaluator.read_activations(samples)
-                   logger.info("computing/reading sample batch statistics...")
-                   sample_stats, _ = evaluator.read_statistics(samples, sample_acts)
-                   FID = sample_stats.frechet_distance(ref_stats)
+                #    evaluator = Evaluator(tf.Session(config=config),batch_size=32)
+                #    evaluator.warmup()
+                #    logger.info("computing reference batch activations...")
+                #    ref_acts = evaluator.read_activations(gt)
+                #    logger.info("computing/reading reference batch statistics...")
+                #    ref_stats, _ = evaluator.read_statistics(gt, ref_acts)
+                #    logger.info("computing sample batch activations...")
+                #    sample_acts = evaluator.read_activations(samples)
+                #    logger.info("computing/reading sample batch statistics...")
+                #    sample_stats, _ = evaluator.read_statistics(samples, sample_acts)
+                #    FID = sample_stats.frechet_distance(ref_stats)
 
-                   logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
+                #    logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
                     # eval code, delete prev if not the best
-                   vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
+                #    vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
 
-                dist.barrier()
+                # dist.barrier()
                 
                 
                 stats_sum = torch.zeros(4, device=device)

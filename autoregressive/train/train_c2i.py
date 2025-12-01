@@ -15,6 +15,13 @@ import time
 import inspect
 import argparse
 
+import sys
+import wandb
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '../..'))
+sys.path.append(project_root)
+
 from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
@@ -86,6 +93,10 @@ def main(args):
     else:
         logger = create_logger(None)
 
+
+    if rank == 0:
+        wandb_logger = wandb.init(project="LlamaGen-C2I")
+
     # training args
     logger.info(f"{args}")
 
@@ -138,6 +149,26 @@ def main(args):
         pin_memory=True,
         drop_last=True
     )
+    
+    ################### Newly updated code ###################
+    #args.code_path = args.val_code_path
+    # val_dataset = build_dataset(args)
+    # val_sampler = DistributedSampler(
+    #     val_dataset,
+    #    num_replicas=dist.get_world_size(),
+    #    rank=rank,
+    #    shuffle=False,
+    #    seed=args.global_seed
+    #)
+    #val_loader = DataLoader(
+    #    val_dataset,
+    #    batch_size=int(args.global_batch_size // dist.get_world_size()),
+    #    shuffle=False,
+    #     sampler=val_sampler,
+    # )
+    ################### Newly updated code ###################
+    
+    
     flip_info = 'with' if dataset.flip else 'without'
     aug_info = 10 if 'ten_crop' in dataset.feature_dir else 1
     aug_info = 2 * aug_info if dataset.aug_feature_dir is not None else aug_info
@@ -187,6 +218,7 @@ def main(args):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            
             z_indices = x.reshape(x.shape[0], -1)
             c_indices = y.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
@@ -204,7 +236,6 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
             if args.ema:
                 update_ema(ema, model.module._orig_mod if not args.no_compile else model.module)
-
             # Log loss values:
             running_loss += loss.item()
             log_steps += 1
@@ -219,6 +250,8 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                if rank == 0:
+                    wandb_logger.log({"train_loss": avg_loss, "train_steps_per_sec": steps_per_sec}, step=train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -226,28 +259,32 @@ def main(args):
 
             # Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    if not args.no_compile:
-                        model_weight = model.module._orig_mod.state_dict()
-                    else:
-                        model_weight = model.module.state_dict()  
-                    checkpoint = {
-                        "model": model_weight,
-                        "optimizer": optimizer.state_dict(),
-                        "steps": train_steps,
-                        "args": args
-                    }
-                    if args.ema:
-                        checkpoint["ema"] = ema.state_dict()
-                    if not args.no_local_save:
-                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                        torch.save(checkpoint, checkpoint_path)
-                        logger.info(f"Saved checkpoint to {checkpoint_path}")
-                    
-                    cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, cloud_checkpoint_path)
-                    logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-                dist.barrier()
+                if (train_steps >= 1000000) or (train_steps < 1000000 and train_steps % 10000 == 0):
+                    if rank == 0:
+                        if not args.no_compile:
+                            model_weight = model.module._orig_mod.state_dict()
+                        else:
+                            model_weight = model.module.state_dict()  
+                        checkpoint = {
+                            "model": model_weight,
+                            "optimizer": optimizer.state_dict(),
+                            "steps": train_steps,
+                            "args": args
+                        }
+                        if args.ema:
+                            checkpoint["ema"] = ema.state_dict()
+                        if not args.no_local_save:
+                            checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                            torch.save(checkpoint, checkpoint_path)
+                            logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        
+                        cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
+                        # torch.save(checkpoint, cloud_checkpoint_path)
+                        logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
+                    dist.barrier()
+                else:
+                    continue
+            
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -260,6 +297,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--code-path", type=str, required=True)
+    parser.add_argument("--val-code-path", type=str, required=False)
+    
     parser.add_argument("--cloud-save-path", type=str, required=True, help='please specify a cloud disk path, if not, local path')
     parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")

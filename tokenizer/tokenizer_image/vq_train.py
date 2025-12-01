@@ -125,6 +125,7 @@ def main(args):
             soft_ae_training=args.soft_ae_training,
             soft_ae_iters=args.soft_ae_iters,
             soft_ae_scheduler=args.soft_ae_scheduler,
+            simvq_training=args.simvq_training,
         )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -455,8 +456,9 @@ def main(args):
                         checkpoint["ema"] = ema.state_dict()
                     if not args.no_local_save:
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                        torch.save(checkpoint, checkpoint_path)
-                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        if train_steps > 120000:
+                            torch.save(checkpoint, checkpoint_path)
+                            logger.info(f"Saved checkpoint to {checkpoint_path}")
                     
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     # torch.save(checkpoint, cloud_checkpoint_path)
@@ -528,6 +530,8 @@ if __name__ == "__main__":
     parser.add_argument("--soft-ae-training", action='store_true', default=False, help="use soft ae training")
     parser.add_argument("--soft-ae-iters", type=int, default=25000, help="soft ae training iterations")
     parser.add_argument("--soft-ae-scheduler", type=str, default='cosine', help="soft ae training scheduler")
+    
+    parser.add_argument("--simvq-training", action='store_true', default=False, help="use simvq training")
     
     parser.add_argument("--uni-constraint", action='store_true', default=False, help="enable the uniform constraint")
     

@@ -33,6 +33,7 @@ class ModelArgs:
     soft_ae_iters: int = 25000
     soft_ae_scheduler: str = 'cosine'
     
+    simvq_training: bool = False
 
 class AEModel(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -48,6 +49,7 @@ class AEModel(nn.Module):
         
         self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
+        
         
         self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
@@ -102,11 +104,12 @@ class VQModel(nn.Module):
         self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
 
+
         self.quantize = VectorQuantizer(config.codebook_size, config.codebook_embed_dim, 
                                         config.commit_loss_beta, config.entropy_loss_ratio,
                                         config.codebook_l2_norm, config.codebook_show_usage, config.kmeans_ini_flag,
-                                        config.soft_ae_training, config.soft_ae_iters, config.soft_ae_scheduler
-                                        )
+                                        config.soft_ae_training, config.soft_ae_iters, config.soft_ae_scheduler, 
+                                        config.simvq_training)
         self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
 
@@ -136,6 +139,9 @@ class VQModel(nn.Module):
         quant, _, _ = self.encode(x)
         dec = self.decode(quant)
         return dec
+    
+    def get_codebook(self):
+        return self.quantize.get_codebook()
 
 
 
@@ -273,7 +279,7 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage, kmeans_ini_flag, soft_ae_training, soft_ae_iters, soft_ae_scheduler):
+    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage, kmeans_ini_flag, soft_ae_training, soft_ae_iters, soft_ae_scheduler, simvq_training=False):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -281,6 +287,7 @@ class VectorQuantizer(nn.Module):
         self.entropy_loss_ratio = entropy_loss_ratio
         self.l2_norm = l2_norm
         self.show_usage = show_usage
+        self.simvq_training = simvq_training
 
         self.kmeans_ini_flag = kmeans_ini_flag
 
@@ -290,7 +297,16 @@ class VectorQuantizer(nn.Module):
             self.embedding.weight.data = F.normalize(self.embedding.weight.data, p=2, dim=-1)
         if self.show_usage:
             self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536)))
-            
+        
+        
+        if self.simvq_training:
+            print('simvq_training is True')
+            nn.init.normal_(self.embedding.weight, mean=0, std=self.e_dim**-0.5)
+            for p in self.embedding.parameters():
+                p.requires_grad = False
+            self.embedding_proj = nn.Linear(self.e_dim, self.e_dim)
+        
+        
         self.register_buffer('initialized_buffer', torch.zeros(1, dtype=torch.bool))
         
         self.soft_ae_training = soft_ae_training
@@ -368,9 +384,18 @@ class VectorQuantizer(nn.Module):
         if self.l2_norm:
             z = F.normalize(z, p=2, dim=-1)
             z_flattened = F.normalize(z_flattened, p=2, dim=-1)
-            embedding = F.normalize(self.embedding.weight, p=2, dim=-1)
+            
+            if self.simvq_training:
+                quant_codebook = self.embedding_proj(self.embedding.weight)
+                embedding = F.normalize(quant_codebook, p=2, dim=-1)
+            else:
+                embedding = F.normalize(self.embedding.weight, p=2, dim=-1)
         else:
-            embedding = self.embedding.weight
+            if self.simvq_training:
+                quant_codebook = self.embedding_proj(self.embedding.weight)
+                embedding = quant_codebook
+            else:
+                embedding = self.embedding.weight
 
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
             torch.sum(embedding**2, dim=1) - 2 * \
@@ -378,8 +403,19 @@ class VectorQuantizer(nn.Module):
 
         min_encoding_indices = torch.argmin(d, dim=1)
         z_q = embedding[min_encoding_indices].view(z.shape)
-        perplexity = None
-        min_encodings = None
+        
+        
+        # compute perplexity
+        min_encodings = torch.zeros(
+            min_encoding_indices.unsqueeze(1).shape[0], self.n_e).to(z.device)
+        min_encodings.scatter_(1, min_encoding_indices.unsqueeze(1), 1)
+        
+        e_mean = torch.mean(min_encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+        #########################################################
+        
+        # perplexity = None
+        # min_encodings = None
         vq_loss = None
         commit_loss = None
         entropy_loss = None
@@ -414,9 +450,15 @@ class VectorQuantizer(nn.Module):
     def get_codebook_entry(self, indices, shape=None, channel_first=True):
         # shape = (batch, channel, height, width) if channel_first else (batch, height, width, channel)
         if self.l2_norm:
-            embedding = F.normalize(self.embedding.weight, p=2, dim=-1)
+            if self.simvq_training:
+                embedding = F.normalize(self.embedding_proj(self.embedding.weight), p=2, dim=-1)
+            else:
+                embedding = F.normalize(self.embedding.weight, p=2, dim=-1)
         else:
-            embedding = self.embedding.weight
+            if self.simvq_training:
+                embedding = self.embedding_proj(self.embedding.weight)
+            else:
+                embedding = self.embedding.weight
         z_q = embedding[indices]  # (b*h*w, c)
 
         if shape is not None:
@@ -427,6 +469,12 @@ class VectorQuantizer(nn.Module):
             else:
                 z_q = z_q.view(shape)
         return z_q
+
+    def get_codebook(self):
+        if self.simvq_training:
+            return self.embedding_proj(self.embedding.weight)
+        else:
+            return self.embedding.weight
 
 
 class ResnetBlock(nn.Module):

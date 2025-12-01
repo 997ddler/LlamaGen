@@ -2,6 +2,6 @@
 set -x
 
 torchrun \
---nnodes=$nnodes --nproc_per_node=$nproc_per_node --node_rank=$node_rank \
---master_addr=$master_addr --master_port=$master_port \
+--nnodes=1 --nproc_per_node=8 --node_rank=0 \
+--master_addr=localhost --master_port=12348 \
 autoregressive/train/train_c2i.py "$@"

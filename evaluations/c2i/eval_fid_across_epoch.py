@@ -57,7 +57,7 @@ def extract_iteration_number(ckpt_path):
         return None
 
 
-def get_checkpoint_files(weights_dir, interval=50000):
+def get_checkpoint_files(weights_dir, interval=1000):
     """
     file format: 0034000.pt (pure number.pt, guaranteed to be a multiple of 500)
     """
@@ -241,7 +241,8 @@ def main(args):
     vq_model = VQ_models[args.vq_model](
         codebook_size=args.codebook_size,
         codebook_embed_dim=args.codebook_embed_dim,
-        codebook_l2_norm=args.codebook_l2_norm # Original llamagen is True
+        codebook_l2_norm=args.codebook_l2_norm, # Original llamagen is True
+        simvq_training=args.simvq_training
         )
     vq_model.to(device)
     vq_model.eval()
@@ -298,7 +299,7 @@ def main(args):
     # evaluate each checkpoint
     fid_results = {}
     for ckpt_iter, ckpt_path in checkpoint_list:
-        if ckpt_iter < 470000:
+        if ckpt_iter < 144000:
              continue
         
         fid, psnr, ssim = evaluate_checkpoint(
@@ -347,6 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--codebook-l2-norm", action="store_true", default=False)
+    parser.add_argument("--simvq-training", action="store_true", default=False)
     args = parser.parse_args()
 
     results_dir = os.path.dirname(args.weights_dir)

@@ -178,3 +178,5 @@ classify_image_graph_def.pb
 Eval_*
 *.o*
 val_cmd.txt
+pretrained/
+run_env.sh

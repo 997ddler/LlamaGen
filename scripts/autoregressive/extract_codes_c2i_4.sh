@@ -3,5 +3,5 @@ set -x
 
 torchrun \
 --nnodes=1 --nproc_per_node=4 --node_rank=0 \
---master_port=12339 \
+--master_port=12336 \
 autoregressive/train/extract_codes_c2i.py "$@"

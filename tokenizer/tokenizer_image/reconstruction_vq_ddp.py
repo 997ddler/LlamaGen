@@ -28,6 +28,7 @@ from tokenizer.tokenizer_image.vq_model import VQ_models
 
 
 from torchvision.datasets import ImageFolder
+from tokenizer.tokenizer_image.lpips import LPIPS
 
 
 def create_npz_from_sample_folder(sample_dir, num=50000):
@@ -65,7 +66,8 @@ def main(args):
     # create and load model
     vq_model = VQ_models[args.vq_model](
         codebook_size=args.codebook_size,
-        codebook_embed_dim=args.codebook_embed_dim)
+        codebook_embed_dim=args.codebook_embed_dim,
+        simvq_training=args.simvq_training)
     vq_model.to(device)
     vq_model.eval()
 
@@ -135,12 +137,31 @@ def main(args):
         drop_last=False
     )    
 
+    
+    ##### Compute the pairwise distance between code 
+    codebook = vq_model.get_codebook()
+    codebook = codebook.to("cpu")
+    euclidean_dist_matrix = torch.cdist(codebook, codebook, p=2)
+    euclidean_dist_mean = euclidean_dist_matrix.mean()
+    print(f'Euclidean Distance: {euclidean_dist_mean}')
+    
+    
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
     
+    
+    
+    
+    # perceptual_loss = LPIPS().to(device)
+    #perceptual_loss.eval()
+    
     psnr_val_rgb = []
     ssim_val_rgb = []
+    perplexity_val = []
+    
+    codebook_usage = torch.zeros(args.codebook_size, dtype=torch.long, device=device)
+    
     loader = tqdm(loader) if rank == 0 else loader
     total = 0
     for x, _ in loader:
@@ -148,56 +169,110 @@ def main(args):
             rgb_gts = F.interpolate(x, size=(args.image_size_eval, args.image_size_eval), mode='bicubic')
         else:
             rgb_gts = x
-        rgb_gts = (rgb_gts.permute(0, 2, 3, 1).to("cpu").numpy() + 1.0) / 2.0 # rgb_gt value is between [0, 1]
+        rgb_gts = (rgb_gts.permute(0, 2, 3, 1).to("cpu").numpy() + 1.0) / 2.0
         x = x.to(device, non_blocking=True)
-        with torch.no_grad():
 
+        with torch.no_grad():
             if args.vq_model == 'AE':
-                # latent, _, [_, _, indices] = vq_model.encode(x)
-                # samples = vq_model.decode_code(indices, latent.shape) # output value is between [-1, 1]
                 samples, _ = vq_model(x)
+                perplexity = None
+                indices = None
             else:
-                latent, _, [_, _, indices] = vq_model.encode(x)
-                samples = vq_model.decode_code(indices, latent.shape) # output value is between [-1, 1]
+                latent, _, [perplexity, _, indices] = vq_model.encode(x)
+                samples = vq_model.decode_code(indices, latent.shape)
+                
+                # 添加：统计当前batch的codebook使用情况
+                if indices is not None:
+                    # indices可能是多维的，需要flatten
+                    indices_flat = indices.flatten()
+                    # 使用bincount统计每个index的出现次数
+                    bincount = torch.bincount(indices_flat, minlength=args.codebook_size)
+                    codebook_usage += bincount[:args.codebook_size]
+            
+            # calculate perceptual loss
+            # perceptual_vals = perceptual_loss(x, samples)
+            
+            # accumulate current batch's sum and count
+            # perceptual_sum += perceptual_vals.sum().item()
+            # perceptual_count += perceptual_vals.shape[0]
+            
             if args.image_size_eval != args.image_size:
                 samples = F.interpolate(samples, size=(args.image_size_eval, args.image_size_eval), mode='bicubic')
+        
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+        
+        print(f"perplexity: {perplexity}")
+        if perplexity is not None:
+            perplexity_val.append(perplexity.item())
 
         # Save samples to disk as individual .png files
         for i, (sample, rgb_gt) in enumerate(zip(samples, rgb_gts)):
             index = i * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
             # metric
-            rgb_restored = sample.astype(np.float32) / 255. # rgb_restored value is between [0, 1]
+            rgb_restored = sample.astype(np.float32) / 255.
             psnr = psnr_loss(rgb_restored, rgb_gt)
             ssim = ssim_loss(rgb_restored, rgb_gt, multichannel=True, data_range=2.0, channel_axis=-1)
             psnr_val_rgb.append(psnr)
             ssim_val_rgb.append(ssim)
-            
         total += global_batch_size
 
     # ------------------------------------
     #       Summary
     # ------------------------------------
-    # Make sure all processes have finished saving their samples
     dist.barrier()
     world_size = dist.get_world_size()
     gather_psnr_val = [None for _ in range(world_size)]
     gather_ssim_val = [None for _ in range(world_size)]
+    gather_perplexity_val = [None for _ in range(world_size)]
+    
+    # perceptual_stats = (perceptual_sum, perceptual_count)
+    # gather_perceptual_stats = [None for _ in range(world_size)]
+    
+    # 添加：收集所有进程的codebook usage
+    gather_codebook_usage = [torch.zeros(args.codebook_size, dtype=torch.long, device=device) 
+                             for _ in range(world_size)]
+    dist.all_gather(gather_codebook_usage, codebook_usage)
+    
     dist.all_gather_object(gather_psnr_val, psnr_val_rgb)
     dist.all_gather_object(gather_ssim_val, ssim_val_rgb)
-
+    dist.all_gather_object(gather_perplexity_val, perplexity_val)
+    # dist.all_gather_object(gather_perceptual_stats, perceptual_stats)
+    
     if rank == 0:
         gather_psnr_val = list(itertools.chain(*gather_psnr_val))
         gather_ssim_val = list(itertools.chain(*gather_ssim_val))        
+        gather_perplexity_val = list(itertools.chain(*gather_perplexity_val))
+        gather_perplexity_val = [p for p in gather_perplexity_val if p is not None]
+        
+        # 添加：计算总的codebook usage
+        total_codebook_usage = sum(gather_codebook_usage)
+        used_indices = (total_codebook_usage > 0).sum().item()
+        codebook_usage_rate = used_indices / args.codebook_size
+        
+        # calculate weighted average
+        # total_perceptual_sum = sum(stats[0] for stats in gather_perceptual_stats)
+        # total_perceptual_count = sum(stats[1] for stats in gather_perceptual_stats)
+        # perceptual_val_rgb = total_perceptual_sum / total_perceptual_count
+        
         psnr_val_rgb = sum(gather_psnr_val) / len(gather_psnr_val)
         ssim_val_rgb = sum(gather_ssim_val) / len(gather_ssim_val)
-        print("PSNR: %f, SSIM: %f " % (psnr_val_rgb, ssim_val_rgb))
+        
+        if len(gather_perplexity_val) > 0:
+            perplexity_val = sum(gather_perplexity_val) / len(gather_perplexity_val)
+            print("PSNR: %f, SSIM: %f, Perplexity: %f, Codebook Usage: %f (%d/%d)" % 
+                  (psnr_val_rgb, ssim_val_rgb, perplexity_val, 
+                   codebook_usage_rate, used_indices, args.codebook_size))
+        else:
+            print("PSNR: %f, SSIM: %f, Codebook Usage: %f (%d/%d)" % 
+                  (psnr_val_rgb, ssim_val_rgb,  
+                   codebook_usage_rate, used_indices, args.codebook_size))
 
         result_file = f"{sample_folder_dir}_results.txt"
         print("writing results to {}".format(result_file))
         with open(result_file, 'w') as f:
-            print("PSNR: %f, SSIM: %f " % (psnr_val_rgb, ssim_val_rgb), file=f)
+            print("PSNR: %f, SSIM: %f, Perplexity: %f, Codebook Usage: %f (%d/%d)" % 
+                  (psnr_val_rgb, ssim_val_rgb, perplexity_val, codebook_usage_rate, used_indices, args.codebook_size), file=f)
 
         create_npz_from_sample_folder(sample_folder_dir, num_fid_samples)
         print("Done.")
@@ -221,5 +296,6 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--test-loader", action="store_true", default=False)
+    parser.add_argument("--simvq-training", action="store_true", default=False)
     args = parser.parse_args()
     main(args)

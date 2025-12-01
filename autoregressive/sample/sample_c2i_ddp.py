@@ -6,12 +6,21 @@ torch.backends.cudnn.allow_tf32 = True
 import torch.nn.functional as F
 import torch.distributed as dist
 
+
+
+
 from tqdm import tqdm
 import os
 from PIL import Image
 import numpy as np
 import math
 import argparse
+
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '../..'))
+sys.path.append(project_root)
+
 
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt import GPT_models
@@ -178,7 +187,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--cfg-interval", type=float, default=-1)
     parser.add_argument("--sample-dir", type=str, default="samples")
-    parser.add_argument("--per-proc-batch-size", type=int, default=32)
+    parser.add_argument("--per-proc-batch-size", type=int, default=64)
     parser.add_argument("--num-fid-samples", type=int, default=50000)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=0,help="top-k value to sample with")

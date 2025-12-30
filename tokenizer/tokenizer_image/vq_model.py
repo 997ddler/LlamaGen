@@ -33,7 +33,15 @@ class ModelArgs:
     soft_ae_iters: int = 25000
     soft_ae_scheduler: str = 'cosine'
     
+    soft_loss: bool = True
+    lambda_loss: float = 0.5
+    soft_representation: bool = True
+    
+    
     simvq_training: bool = False
+    
+
+    
 
 class AEModel(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -105,11 +113,11 @@ class VQModel(nn.Module):
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
 
 
-        self.quantize = VectorQuantizer(config.codebook_size, config.codebook_embed_dim, 
-                                        config.commit_loss_beta, config.entropy_loss_ratio,
-                                        config.codebook_l2_norm, config.codebook_show_usage, config.kmeans_ini_flag,
-                                        config.soft_ae_training, config.soft_ae_iters, config.soft_ae_scheduler, 
-                                        config.simvq_training)
+        self.quantize = VectorQuantizer(n_e=config.codebook_size, e_dim=config.codebook_embed_dim, 
+                                        beta=config.commit_loss_beta, entropy_loss_ratio=config.entropy_loss_ratio,
+                                        l2_norm=config.codebook_l2_norm, show_usage=config.codebook_show_usage, kmeans_ini_flag=config.kmeans_ini_flag,
+                                        soft_ae_training=config.soft_ae_training, soft_ae_iters=config.soft_ae_iters, soft_ae_scheduler=config.soft_ae_scheduler, 
+                                        simvq_training=config.simvq_training, lambda_loss=config.lambda_loss, soft_representation=config.soft_representation, soft_loss=config.soft_loss)
         self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
 
@@ -279,7 +287,22 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage, kmeans_ini_flag, soft_ae_training, soft_ae_iters, soft_ae_scheduler, simvq_training=False):
+    def __init__(
+                self, 
+                n_e, 
+                e_dim, 
+                beta, 
+                entropy_loss_ratio, 
+                l2_norm, show_usage, 
+                kmeans_ini_flag, 
+                soft_ae_training=False, 
+                soft_ae_iters=10000, 
+                soft_ae_scheduler='cosine', 
+                simvq_training=False, 
+                lambda_loss=0.5, 
+                soft_loss=True, 
+                soft_representation=True
+                ):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -315,6 +338,9 @@ class VectorQuantizer(nn.Module):
         
         if self.soft_ae_training:
             self.sche_a = 1.0
+            self.lambda_loss = lambda_loss
+            self.soft_loss = soft_loss
+            self.soft_representation = soft_representation
 
     @torch.no_grad()
     def init_codebook_with_first_batch(self, data):
@@ -434,9 +460,17 @@ class VectorQuantizer(nn.Module):
             entropy_loss = self.entropy_loss_ratio * compute_entropy_loss(-d)
 
         if self.training and self.soft_ae_training:
-            z_q = self.sche_a * z + (1-self.sche_a) * (z + (z_q - z).detach())
-            commit_loss = (0.5 * (1 - self.sche_a) + 0.5) * commit_loss
-            vq_loss = (0.5 * (1 - self.sche_a) + 0.5) * vq_loss
+            if self.soft_representation:
+                z_q = self.sche_a * z + (1-self.sche_a) * (z + (z_q - z).detach())
+            else:
+                if self.sche_a != 0.0:
+                    z_q = z
+                else:
+                    z_q = z + (z_q - z).detach()
+            
+            if self.soft_loss:
+                commit_loss = ((1 - self.lambda_loss) * (1 - self.sche_a) + self.lambda_loss) * commit_loss
+                vq_loss = ((1 - self.lambda_loss) * (1 - self.sche_a) + self.lambda_loss) * vq_loss
             
         else: 
             # preserve gradients

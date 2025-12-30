@@ -126,6 +126,9 @@ def main(args):
             soft_ae_iters=args.soft_ae_iters,
             soft_ae_scheduler=args.soft_ae_scheduler,
             simvq_training=args.simvq_training,
+            lambda_loss=args.lambda_loss,
+            soft_representation=args.soft_representation,
+            soft_loss=args.soft_loss,
         )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -456,7 +459,7 @@ def main(args):
                         checkpoint["ema"] = ema.state_dict()
                     if not args.no_local_save:
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                        if train_steps > 120000:
+                        if train_steps > 100000:
                             torch.save(checkpoint, checkpoint_path)
                             logger.info(f"Saved checkpoint to {checkpoint_path}")
                     
@@ -530,6 +533,10 @@ if __name__ == "__main__":
     parser.add_argument("--soft-ae-training", action='store_true', default=False, help="use soft ae training")
     parser.add_argument("--soft-ae-iters", type=int, default=25000, help="soft ae training iterations")
     parser.add_argument("--soft-ae-scheduler", type=str, default='cosine', help="soft ae training scheduler")
+    parser.add_argument("--no-soft-representation", action='store_true', default=False, help="no soft representation")
+    parser.add_argument("--no-soft-loss", action='store_true', default=False, help="no soft loss")
+    parser.add_argument("--lambda-loss", type=float, default=0.5, help="lambda loss")
+    
     
     parser.add_argument("--simvq-training", action='store_true', default=False, help="use simvq training")
     
@@ -542,5 +549,11 @@ if __name__ == "__main__":
     
     if args.ae_path is None and args.ae_load:
         raise ValueError("ae_train is None, but ae_load is True")
+    
+    
+    
+    if args.soft_ae_training:
+        args.soft_representation = not args.no_soft_representation
+        args.soft_loss = not args.no_soft_loss
     
     main(args)

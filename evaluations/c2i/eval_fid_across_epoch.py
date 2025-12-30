@@ -299,8 +299,8 @@ def main(args):
     # evaluate each checkpoint
     fid_results = {}
     for ckpt_iter, ckpt_path in checkpoint_list:
-        if ckpt_iter < 144000:
-             continue
+        # if ckpt_iter <:
+        #     continue
         
         fid, psnr, ssim = evaluate_checkpoint(
             args, vq_model, ckpt_path, ckpt_iter, 
